@@ -2,18 +2,21 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const { ethers } = require("ethers");
-// For concurrency-limited swaps
-const pLimit = require("p-limit"); // v2.3.0 ensures CommonJS compatibility
+// For concurrency-limited swaps (use p-limit@2.3.0)
+const pLimit = require("p-limit");
+
 
 // ---------------------- CONFIG & CONSTANTS ------------------------
 const chainId = 1; // Ethereum mainnet
 // 1inch dev aggregator base (v6)
 const aggregatorBase = `https://api.1inch.dev/swap/v6.0/${chainId}`;
-const API_KEY = process.env.API_KEY;
+const API_KEY = process.env.API_KEY; // aggregator API key from .env
+const INFURA_URL = process.env.INFURA_URL; // your Infura (or Alchemy) RPC
 
-const provider = new ethers.providers.JsonRpcProvider(process.env.INFURA_URL);
-// The wallet used for swapping
-const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+// We DO NOT store a global wallet here anymore.
+// We'll create a wallet dynamically in /placeOrders route from request headers.
+
+const provider = new ethers.providers.JsonRpcProvider(INFURA_URL);
 
 // 1inch dev aggregator spender address for Ethereum
 const oneInchRouter = "0x111111125421ca6dc452d289314280a0f8842a65";
@@ -31,6 +34,7 @@ const activeOrders = [];
 // Concurrency limit for swap orders
 const limit = pLimit(2);
 
+// Sleep utility
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -41,7 +45,10 @@ function sleep(ms) {
  */
 async function fetchTokenData(tokenAddress) {
   // If it's ETH placeholder
-  if (!tokenAddress || tokenAddress.toLowerCase() === "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee") {
+  if (
+    !tokenAddress ||
+    tokenAddress.toLowerCase() === "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  ) {
     return {
       symbol: "ETH",
       decimals: 18
@@ -57,33 +64,37 @@ async function fetchTokenData(tokenAddress) {
 }
 
 /**
- * 1) Convert user-friendly amount => wei
- * 2) Check allowance (if fromToken != ETH), do approve if needed
- * 3) Call 1inch aggregator /swap
- * 4) Broadcast transaction
+ * processOrder: 
+ * 1) Create a contract instance with the dynamicWallet for fromToken
+ * 2) Check allowance + approve if needed
+ * 3) Call aggregator /swap
+ * 4) Sign & broadcast transaction
  */
-async function processOrder(order) {
+async function processOrder(order, dynamicWallet) {
   const { fromToken, toToken, amountHuman } = order;
 
-  // (A) fetch 'fromToken' decimals/symbol if not provided
+  // (A) fetch fromToken data if not provided
   let fromData;
   if (order.fromDecimals && order.fromSymbol) {
     fromData = { decimals: order.fromDecimals, symbol: order.fromSymbol };
   } else {
     fromData = await fetchTokenData(fromToken);
   }
-  // (B) fetch 'toToken' decimals/symbol for logging
+  // (B) fetch toToken data for logging
   const toData = await fetchTokenData(toToken);
 
   // parse user-friendly amount to BN
   const amountWei = ethers.utils.parseUnits(amountHuman, fromData.decimals);
 
-  console.log(`\n[PROCESS] Swapping ${amountHuman} ${fromData.symbol}(${fromToken}) => ${toData.symbol}(${toToken})`);
+  console.log(
+    `\n[PROCESS] Swapping ${amountHuman} ${fromData.symbol}(${fromToken}) => ` +
+    `${toData.symbol}(${toToken})`
+  );
 
   // (C) If fromToken != ETH, check + approve if needed
   if (fromToken.toLowerCase() !== "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee") {
-    const contract = new ethers.Contract(fromToken, ERC20_ABI, wallet);
-    const currentAllowance = await contract.allowance(wallet.address, oneInchRouter);
+    const contract = new ethers.Contract(fromToken, ERC20_ABI, dynamicWallet);
+    const currentAllowance = await contract.allowance(dynamicWallet.address, oneInchRouter);
 
     if (currentAllowance.lt(amountWei)) {
       console.log(`[ALLOWANCE] Not enough for ${fromData.symbol}. Approving...`);
@@ -98,14 +109,13 @@ async function processOrder(order) {
   }
 
   // (D) Build aggregator /swap call
-  // We set slippage=5, fee=0, from=..., origin=...
   const slippage = 5;
   const fee = 0;
-  const fromAddress = wallet.address;
-  const originAddress = wallet.address;
+  const fromAddress = dynamicWallet.address; 
+  const originAddress = dynamicWallet.address; 
 
-  const swapUrl = `${aggregatorBase}/swap?` +
-    `src=${fromToken}&dst=${toToken}&amount=${amountWei.toString()}` +
+  const swapUrl =
+    `${aggregatorBase}/swap?src=${fromToken}&dst=${toToken}&amount=${amountWei.toString()}` +
     `&from=${fromAddress}&origin=${originAddress}&slippage=${slippage}&fee=${fee}`;
 
   // (E) Call aggregator, handle rate-limit
@@ -120,17 +130,19 @@ async function processOrder(order) {
     if (errMsg.includes("limit of requests per second")) {
       console.log("[RATE LIMIT] Wait 3s, retry once...");
       await sleep(3000);
-      swapRes = await axios.get(swapUrl, { headers: { Authorization: API_KEY } });
+      swapRes = await axios.get(swapUrl, {
+        headers: { Authorization: API_KEY },
+      });
     } else {
       throw new Error(`Swap from ${fromData.symbol} to ${toData.symbol} failed: ${errMsg}`);
     }
   }
 
+  // (F) Sign & broadcast
   const txData = swapRes.data.tx;
   console.log(`[SWAP] Broadcasting swap for ${fromData.symbol} => ${toData.symbol}...`);
 
-  // (F) Sign + broadcast
-  const txSend = await wallet.sendTransaction({
+  const txSend = await dynamicWallet.sendTransaction({
     to: txData.to,
     data: txData.data,
     value: txData.value ? ethers.BigNumber.from(txData.value) : 0,
@@ -157,6 +169,7 @@ app.use(express.json());
 /**
  * (1) POST /quote
  * Returns a quote for how many tokens you'd receive. 
+ * No private key or wallet needed for a quote, it's a read-only aggregator call.
  */
 app.post("/quote", async (req, res) => {
   try {
@@ -230,15 +243,38 @@ app.post("/quote", async (req, res) => {
 /**
  * (2) POST /placeOrders
  * Accept multiple orders, concurrency-limited swaps
+ * 
+ * We now require:
+ * - Private key + wallet address from request headers
+ * - Orders in body
  */
 app.post("/placeOrders", async (req, res) => {
   try {
+    // A) Get private key & wallet address from headers
+    const privateKey = req.headers["x-private-key"];
+    const walletAddressFromHeader = req.headers["x-wallet-address"];
+    if (!privateKey || !walletAddressFromHeader) {
+      return res.status(400).json({
+        error: "Missing 'x-private-key' or 'x-wallet-address' header",
+      });
+    }
+
+    // Create a dynamic wallet from the user-supplied private key
+    const dynamicWallet = new ethers.Wallet(privateKey, provider);
+    // Check if derived address matches header
+    if (dynamicWallet.address.toLowerCase() !== walletAddressFromHeader.toLowerCase()) {
+      return res.status(400).json({
+        error: "Supplied wallet address does not match private key's derived address.",
+      });
+    }
+
+    // B) The orders array from body
     const { orders } = req.body;
     if (!orders || !Array.isArray(orders)) {
       return res.status(400).json({ error: "Missing or invalid 'orders' array" });
     }
 
-    // push new orders
+    // push new orders in memory
     for (const o of orders) {
       o.id = Math.floor(Math.random() * 1e9).toString();
       activeOrders.push(o);
@@ -251,7 +287,9 @@ app.post("/placeOrders", async (req, res) => {
         const orderId = order.id;
         console.log(`[START] Order #${orderId} => ${order.fromToken} -> ${order.toToken}`);
         try {
-          const result = await processOrder(order);
+          // pass dynamicWallet to processOrder
+          const result = await processOrder(order, dynamicWallet);
+
           // remove from array
           const idx = activeOrders.findIndex((x) => x.id === orderId);
           if (idx !== -1) activeOrders.splice(idx, 1);
